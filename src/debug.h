@@ -1,7 +1,5 @@
 #pragma once
 
-#define DEBUG 
-
 #ifdef DEBUG
   #include <stdio.h>
   #include <time.h>

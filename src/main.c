@@ -317,13 +317,13 @@ int setup_sdl(){
         printf("error: %s", SDL_GetError());
     
     // init static
-    pause_icon = IMG_LoadTexture(renderer, "../assets/img/pause_icon.png");
+    pause_icon = IMG_LoadTexture(renderer, "assets/img/pause_icon.png");
     if (!pause_icon){
         printf("Error: IMG_LoadTexture failed (pause_icon): %s\n", SDL_GetError());
     }
     SDL_SetTextureScaleMode(pause_icon, SDL_SCALEMODE_LINEAR);
     
-    play_icon = IMG_LoadTexture(renderer, "../assets/img/play_icon.png");
+    play_icon = IMG_LoadTexture(renderer, "assets/img/play_icon.png");
     if (!play_icon){
         printf("Error: IMG_LoadTexture failed (play_icon): %s\n", SDL_GetError());
     }   
@@ -333,7 +333,7 @@ int setup_sdl(){
         return -1;
     }
 
-    ttf_font = TTF_OpenFont("../assets/font/claimcheck.ttf", ttf_font_size);
+    ttf_font = TTF_OpenFont("assets/font/claimcheck.ttf", ttf_font_size);
     if (!ttf_font){
         printf("Error: TTF_OpenFont failed: %s\n", SDL_GetError());
     }   
@@ -543,7 +543,8 @@ void cleanup(void){
 
 int main(int argc, char **argv) {
     if (argc < 2){
-        printf("argument needed\n");
+        printf("Error: No .wav file specified.\n");
+        printf("Usage: ./audio_player /full/path/to/your/audio.wav\n");
         return 1;
     }
     
