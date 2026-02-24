@@ -11,13 +11,71 @@
 
 #include "debug.h"
 
-/* Constants */
+// =============================================================================
+// Constants
+// =============================================================================
+
 #define RUNNING 1
 #define STOPPED 0
 #define WAV_HEADER_SIZE 44
 #define MAX_HEADER_SIZE 44
 
-/* Global variables*/
+#define BG_COLOR 209, 229, 244, 255
+#define GRAPHIC_COLOR 22, 30, 26, 255
+#define TIME_COUNTER_COLOR 0, 0, 0, 255
+
+// =============================================================================
+// Structs
+// =============================================================================
+
+struct audio_buffer{
+    Uint32 len;
+    Uint8 *buf;
+    Uint32 pos;
+    SDL_AudioSpec spec; 
+};
+
+/**
+ * audio_track_time
+ *
+ * Snapshot of playback timing in whole seconds:
+ * - elapsed_sec:   seconds played since the start (0..total_sec)
+ * - remaining_sec: seconds left until the end (0..total_sec), typically for countdown UI
+ * - total_sec:     total duration in seconds
+ */
+typedef struct audio_track_time {
+    int elapsed_sec;
+    int remaining_sec;
+    int total_sec;
+} audio_track_time;
+
+
+//The drag_kind enum represent drag on a different buttons  
+typedef enum {
+    DRAG_NONE = 0,
+    DRAG_TIMELINE,
+    DRAG_VOLUME
+} drag_kind;
+
+typedef struct {
+    audio_track_time track_time;
+    drag_kind drag;
+    SDL_FRect timeline_btn;
+    SDL_FRect volume_btn;
+    float slider_pos;
+    float *rms; 
+    int rms_count;
+} AppState;
+
+void init_state(AppState *state){
+    state->drag = DRAG_NONE;
+    state->rms = NULL;
+}
+
+// =============================================================================
+// Globals 
+// =============================================================================
+
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer = NULL;
 static SDL_Surface *screen = NULL;
@@ -72,21 +130,20 @@ static SDL_AudioStream *stream = NULL;
 
 static SDL_AudioDeviceID audio_devid;
 
-struct audio_buffer{
-    Uint32 len;
-    Uint8 *buf;
-    Uint32 pos;
-    SDL_AudioSpec spec; 
-};
-
 pthread_mutex_t audio_mu = PTHREAD_MUTEX_INITIALIZER;
 struct audio_buffer *audio = NULL;
 
-static float *rms = NULL;
+// =============================================================================
+// Some declarations
+// =============================================================================
 
-#define background_color 209, 229, 244, 255
-#define graphic_color 22, 30, 26, 255
-#define time_counters_color 0, 0, 0, 255
+float *calculate_peaks(int16_t *samples, int windows, int window_samples);
+float *calculate_rms(int16_t *samples, int windows, int window_samples); 
+static audio_track_time calculate_audio_track_time(const struct audio_buffer *a);
+
+// =============================================================================
+// Render 
+// =============================================================================
 
 /** * Test whether an x/y coordinate is within a given rect. * 
  * 
@@ -98,77 +155,98 @@ static int hit_rect(const SDL_FRect *const r, unsigned x, unsigned y){
     /* note the use of unsigned math: no need to check for negative */ 
     return (x - (unsigned)r->x < (unsigned)r->w) && (y - (unsigned)r->y < (unsigned)r->h); } 
 
+static inline int center_y(int y, int h, int inner_h) {
+    return y + (h - inner_h) / 2;
+}
 
-float *calculate_peaks(int16_t *samples, int windows, int window_samples);
-float *calculate_rms(int16_t *samples, int windows, int window_samples); 
-int SDL_RenderFillCircle(SDL_Renderer * renderer, int x, int y, int radius);
+int SDL_RenderFillCircle(SDL_Renderer * renderer, int x, int y, int radius){
+    int offsetx, offsety, d;
+    int status;
 
+    offsetx = 0;
+    offsety = radius;
+    d = radius -1;
+    status = 0;
 
-/**
- * audio_track_time
- *
- * Snapshot of playback timing in whole seconds:
- * - elapsed_sec:   seconds played since the start (0..total_sec)
- * - remaining_sec: seconds left until the end (0..total_sec), typically for countdown UI
- * - total_sec:     total duration in seconds
- */
-typedef struct audio_track_time {
-    int elapsed_sec;
-    int remaining_sec;
-    int total_sec;
-} audio_track_time;
+    while (offsety >= offsetx) {
+        status += SDL_RenderLine(renderer, x - offsety, y + offsetx,
+                                     x + offsety, y + offsetx);
+        status += SDL_RenderLine(renderer, x - offsetx, y + offsety,
+                                     x + offsetx, y + offsety);
+        status += SDL_RenderLine(renderer, x - offsetx, y - offsety,
+                                     x + offsetx, y - offsety);
+        status += SDL_RenderLine(renderer, x - offsety, y - offsetx,
+                                     x + offsety, y - offsetx);
 
+        if (status < 0) {
+            status = -1;
+            break;
+        }
 
-//The drag_kind enum represent drag on a different buttons  
-typedef enum {
-    DRAG_NONE = 0,
-    DRAG_TIMELINE,
-    DRAG_VOLUME
-} drag_kind;
+        if (d >= 2*offsetx) {
+            d -= 2*offsetx + 1;
+            offsetx +=1;
+        }
+        else if (d < 2 * (radius - offsety)) {
+            d += 2 * offsety - 1;
+            offsety -= 1;
+        }
+        else {
+            d += 2 * (offsety - offsetx - 1);
+            offsety -= 1;
+            offsetx += 1;
+        }
+    }
 
-static audio_track_time calculate_audio_track_time(const struct audio_buffer *a);
+    return status;
+}
 
-void render_audio_graphic(){
+void prepare_audio_graphic(AppState *state){
+    const int bar_width = 2;
+    const int gap = 1;
+
+    int graphic_lines = WINDOW_WIDTH / (bar_width + gap);
+
+    int total_samples = audio->len / sizeof(int16_t);
+    int window_samples = total_samples / graphic_lines;
+
+    int16_t *samples = (int16_t *)audio->buf;
+
+    state->rms = calculate_rms(samples, graphic_lines, window_samples);
+    state->rms_count = graphic_lines;
+}
+
+// prepare_audio_graphic is needed
+void render_audio_graphic(AppState *state){
+    if (!state->rms) return;
+
     const int padding = 150;
 
     const int bar_width = 2;
     const int gap = 1;
     
-    int graphic_lines = WINDOW_WIDTH / (bar_width + gap);
     int offset = bar_width + gap;
 
-    int total_samples = audio->len / sizeof(int16_t);
-    int window_samples = total_samples / graphic_lines;
-
-    int windows = graphic_lines;
-
-    int16_t *samples = (int16_t *)audio->buf;
-
-    if (!rms){
-        rms = calculate_rms(samples, windows, window_samples); 
-    }
-
-    SDL_SetRenderDrawColor(renderer, graphic_color);
+    SDL_SetRenderDrawColor(renderer, GRAPHIC_COLOR);
 
     int xpos = 0; 
     const int y1 = padding;
     const int y2 = WINDOW_HEIGHT - padding;
     const int max_line_length = y2 - y1;
 
-    for (int i = 0; i < windows; i++){
-        float coeff = rms[i];
-        // printf("peak %d --> %0.2f\n", i, coeff);
+    for (int i = 0; i < state->rms_count; i++){
+        float coeff = state->rms[i];
         int line_padding = (int)(max_line_length * (1 - coeff) / 3);
         SDL_RenderLine(renderer, xpos, y1 + line_padding, xpos, y2 - line_padding);
         xpos += offset;
     }
 }
 
-void render_screen(){
-    SDL_SetRenderDrawColor(renderer, background_color);
+void render_screen(AppState *state){
+    SDL_SetRenderDrawColor(renderer, BG_COLOR);
     SDL_RenderClear(renderer);
 
-    render_audio_graphic();
+    render_audio_graphic(state);
     
     //draw timeline 
     SDL_RenderFillRect(renderer, &r_timelinebar);
@@ -177,20 +255,16 @@ void render_screen(){
     int cy = r_timelinebar.y + r_timelinebar.h / 2;
     int radius = timelinebtn_size / 2;
     SDL_RenderFillCircle(renderer, cx, cy, radius);
-    // SDL_RenderFillRect(renderer, &r_timelinebtn);
-
-    pthread_mutex_lock(&audio_mu);
-    audio_track_time time = calculate_audio_track_time(audio);
-    pthread_mutex_unlock(&audio_mu);
 
     char time_elapsed_text[16];
     char time_remaining_text[16];
-
+    
+    audio_track_time track_time_state = state->track_time;
     snprintf(time_elapsed_text, sizeof time_elapsed_text, "%d:%02d",
-         time.elapsed_sec / 60, time.elapsed_sec % 60);
+        track_time_state.elapsed_sec / 60, track_time_state.elapsed_sec % 60);
 
     snprintf(time_remaining_text, sizeof time_remaining_text, "%d:%02d",
-         time.remaining_sec / 60, time.remaining_sec % 60);
+        track_time_state.remaining_sec / 60, track_time_state.remaining_sec % 60);
 
     TTF_Text *txt_elapsed = TTF_CreateText(ttf_engine, ttf_font, time_elapsed_text, strlen(time_elapsed_text));
     TTF_Text *txt_remaining = TTF_CreateText(ttf_engine, ttf_font, time_remaining_text, strlen(time_remaining_text));
@@ -198,8 +272,8 @@ void render_screen(){
         fprintf(stderr, "TTF_CreateText failed: %s\n", SDL_GetError());
     }
 
-    TTF_SetTextColor(txt_elapsed, time_counters_color);
-    TTF_SetTextColor(txt_remaining, time_counters_color);
+    TTF_SetTextColor(txt_elapsed, TIME_COUNTER_COLOR);
+    TTF_SetTextColor(txt_remaining, TIME_COUNTER_COLOR);
 
     TTF_DrawRendererText(txt_elapsed, r_time_left.x, r_time_left.y);
 
@@ -224,10 +298,6 @@ void render_screen(){
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
 
     SDL_RenderPresent(renderer);
-}
-
-static inline int center_y(int y, int h, int inner_h) {
-    return y + (h - inner_h) / 2;
 }
 
 void setup_menu(){
@@ -347,6 +417,66 @@ int setup_sdl(){
     return 0;
 }
 
+float *calculate_rms(int16_t *samples, int windows, int window_samples) {
+    float *rms = calloc(windows, sizeof(float));
+
+    for (int i = 0; i < windows; i++) {
+
+        int start = i * window_samples;
+        int end   = start + window_samples;
+
+        double sum = 0.0;
+
+        for (int j = start; j < end; j++) {
+            double v = samples[j];
+            sum += v * v;
+        }
+
+        double mean = sum / window_samples;
+        double value = sqrt(mean);
+
+        rms[i] = (float)(value / 32767.0);
+    }
+
+    return rms;
+}
+
+static audio_track_time calculate_audio_track_time(const struct audio_buffer *a){
+    audio_track_time t = {0, 0, 0};
+
+    const int bytes_per_sample = SDL_AUDIO_BITSIZE(a->spec.format) / 8;
+    const int bytes_per_frame  = bytes_per_sample * a->spec.channels;
+
+    if (bytes_per_frame <= 0 || a->spec.freq <= 0 || a->len == 0) {
+        return t;
+    }
+
+    Uint32 pos = a->pos;
+    if (pos > a->len) pos = a->len;
+
+    const Uint64 total_frames   = (Uint64)a->len / (Uint64)bytes_per_frame;
+    const Uint64 elapsed_frames = (Uint64)pos     / (Uint64)bytes_per_frame;
+
+    const Uint64 total_ms   = total_frames   * 1000ULL / (Uint64)a->spec.freq;
+    const Uint64 elapsed_ms = elapsed_frames * 1000ULL / (Uint64)a->spec.freq;
+
+    const Uint64 clamped_elapsed_ms = (elapsed_ms > total_ms) ? total_ms : elapsed_ms;
+
+    t.total_sec = (int)(total_ms / 1000ULL);
+    t.elapsed_sec = (int)(clamped_elapsed_ms / 1000ULL);
+
+    t.remaining_sec = t.total_sec - t.elapsed_sec;
+
+    // Safety clamps
+    if (t.elapsed_sec < 0) t.elapsed_sec = 0;
+    if (t.total_sec < 0) t.total_sec = 0;
+    if (t.elapsed_sec > t.total_sec) t.elapsed_sec = t.total_sec;
+    if (t.remaining_sec < 0) t.remaining_sec = 0;
+    if (t.remaining_sec > t.total_sec) t.remaining_sec = t.total_sec;
+
+    return t;
+}
+
 int audio_buffer_init(){
     if (!audio || !audio_file_path) {
         fprintf(stderr, "audio or audio_file_path is NULL\n");
@@ -368,7 +498,6 @@ static void audio_callback(
     int additional_amount, 
     int total_amount
 ){  
-    // DEBUG_PRINTF("additional_amount: %d, total_amount: %d\n", additional_amount, total_amount);
     pthread_mutex_lock(&audio_mu);
 
     const int CHUNK_SIZE = 512;
@@ -404,7 +533,6 @@ int setup_audio(){
 
     SDL_ResumeAudioStreamDevice(stream);
 }
-
 
 int setup(void){
     if (setup_sdl() < 0)
@@ -460,23 +588,30 @@ float drag_slider_x(SDL_FRect* btn, const SDL_FRect* bar, float mouse_x){
     return slider_pos;
 }
 
-void update_ui_from_audio(drag_kind drag){
-    if (drag != DRAG_TIMELINE){
-        pthread_mutex_lock(&audio_mu);
+void update(AppState *state){
+    pthread_mutex_lock(&audio_mu);
+
+    if (state->drag != DRAG_TIMELINE){
         float track_percent = (audio->len > 0) ? ((float)audio->pos / (float)audio->len) : 0.0f;
-        pthread_mutex_unlock(&audio_mu);
 
         int minx = r_timelinebar.x;
         int maxx = r_timelinebar.x + r_timelinebar.w - r_timelinebtn.w;
         r_timelinebtn.x = minx + (int)((maxx - minx) * track_percent);
     }
+
+    state->track_time = calculate_audio_track_time(audio);
+
+    pthread_mutex_unlock(&audio_mu);
 }
 
 int mainloop(){
     float slider_pos;
-    drag_kind drag = DRAG_NONE;
     SDL_FPoint mouse;
     
+    AppState state;
+    init_state(&state);
+    prepare_audio_graphic(&state);
+
     int window_status = RUNNING;
     while (window_status == RUNNING) {
         SDL_Event event;
@@ -500,22 +635,22 @@ int mainloop(){
                     toggle_audio();
                 }else if (hit_rect(&r_timelinebtn, mouse.x, mouse.y)
             && event.button.button == SDL_BUTTON_LEFT){
-                    drag=DRAG_TIMELINE;
+                    state.drag=DRAG_TIMELINE;
                 }else if (hit_rect(&r_volumebtn, mouse.x, mouse.y)
             && event.button.button == SDL_BUTTON_LEFT){
-                    drag=DRAG_VOLUME;
+                    state.drag=DRAG_VOLUME;
             }
                 break;
             
             case SDL_EVENT_MOUSE_BUTTON_UP:
-                if (drag == DRAG_TIMELINE)
+                if (state.drag == DRAG_TIMELINE)
                     seek_audio(slider_pos);
                 if (event.button.button==SDL_BUTTON_LEFT)
-                    drag = DRAG_NONE;
+                    state.drag = DRAG_NONE;
                 break;
             
             case SDL_EVENT_MOUSE_MOTION:
-                switch (drag){
+                switch (state.drag){
                 case DRAG_TIMELINE:
                     slider_pos = drag_slider_x(&r_timelinebtn, &r_timelinebar, mouse.x);
                     break;
@@ -527,17 +662,34 @@ int mainloop(){
             }
         }
 
-        //update timeline btn position if btn not dragged
-        update_ui_from_audio(drag);
+        update(&state);
 
-        render_screen();
+        render_screen(&state);
         SDL_Delay(16); 
     }
     return 0;
 }
 
-void cleanup(void){
-    SDL_free(audio->buf);
+void cleanup(){
+    if (stream) SDL_DestroyAudioStream(stream);
+
+    if (audio->buf)
+        SDL_free(audio->buf);
+
+    if (pause_icon)
+        SDL_DestroyTexture(pause_icon);
+
+    if (play_icon)
+        SDL_DestroyTexture(play_icon);
+
+    if (renderer)
+        SDL_DestroyRenderer(renderer);
+
+    if (window)
+        SDL_DestroyWindow(window);
+
+    TTF_Quit();
+
     SDL_Quit();
 }
 
@@ -584,107 +736,4 @@ float *calculate_peaks(int16_t *samples, int windows, int window_samples){
         peaks[i] = peak / 32767.0;
     }
     return peaks;
-}
-
-float *calculate_rms(int16_t *samples, int windows, int window_samples) {
-    float *rms = calloc(windows, sizeof(float));
-
-    for (int i = 0; i < windows; i++) {
-
-        int start = i * window_samples;
-        int end   = start + window_samples;
-
-        double sum = 0.0;
-
-        for (int j = start; j < end; j++) {
-            double v = samples[j];
-            sum += v * v;
-        }
-
-        double mean = sum / window_samples;
-        double value = sqrt(mean);
-
-        rms[i] = (float)(value / 32767.0);
-    }
-
-    return rms;
-}
-
-int SDL_RenderFillCircle(SDL_Renderer * renderer, int x, int y, int radius){
-    int offsetx, offsety, d;
-    int status;
-
-    offsetx = 0;
-    offsety = radius;
-    d = radius -1;
-    status = 0;
-
-    while (offsety >= offsetx) {
-        status += SDL_RenderLine(renderer, x - offsety, y + offsetx,
-                                     x + offsety, y + offsetx);
-        status += SDL_RenderLine(renderer, x - offsetx, y + offsety,
-                                     x + offsetx, y + offsety);
-        status += SDL_RenderLine(renderer, x - offsetx, y - offsety,
-                                     x + offsetx, y - offsety);
-        status += SDL_RenderLine(renderer, x - offsety, y - offsetx,
-                                     x + offsety, y - offsetx);
-
-        if (status < 0) {
-            status = -1;
-            break;
-        }
-
-        if (d >= 2*offsetx) {
-            d -= 2*offsetx + 1;
-            offsetx +=1;
-        }
-        else if (d < 2 * (radius - offsety)) {
-            d += 2 * offsety - 1;
-            offsety -= 1;
-        }
-        else {
-            d += 2 * (offsety - offsetx - 1);
-            offsety -= 1;
-            offsetx += 1;
-        }
-    }
-
-    return status;
-}
-
-static audio_track_time calculate_audio_track_time(const struct audio_buffer *a){
-    audio_track_time t = {0, 0, 0};
-
-    const int bytes_per_sample = SDL_AUDIO_BITSIZE(a->spec.format) / 8;
-    const int bytes_per_frame  = bytes_per_sample * a->spec.channels;
-
-    if (bytes_per_frame <= 0 || a->spec.freq <= 0 || a->len == 0) {
-        return t;
-    }
-
-    Uint32 pos = a->pos;
-    if (pos > a->len) pos = a->len;
-
-    const Uint64 total_frames   = (Uint64)a->len / (Uint64)bytes_per_frame;
-    const Uint64 elapsed_frames = (Uint64)pos     / (Uint64)bytes_per_frame;
-
-    const Uint64 total_ms   = total_frames   * 1000ULL / (Uint64)a->spec.freq;
-    const Uint64 elapsed_ms = elapsed_frames * 1000ULL / (Uint64)a->spec.freq;
-
-    const Uint64 clamped_elapsed_ms = (elapsed_ms > total_ms) ? total_ms : elapsed_ms;
-
-    t.total_sec = (int)(total_ms / 1000ULL);
-    t.elapsed_sec = (int)(clamped_elapsed_ms / 1000ULL);
-
-    // For countdown UIs it's nicer to round up remaining time, so it hits 0 at the end.
-    t.remaining_sec = t.total_sec - t.elapsed_sec;
-
-    // Safety clamps
-    if (t.elapsed_sec < 0) t.elapsed_sec = 0;
-    if (t.total_sec < 0) t.total_sec = 0;
-    if (t.elapsed_sec > t.total_sec) t.elapsed_sec = t.total_sec;
-    if (t.remaining_sec < 0) t.remaining_sec = 0;
-    if (t.remaining_sec > t.total_sec) t.remaining_sec = t.total_sec;
-
-    return t;
 }
