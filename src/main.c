@@ -670,15 +670,14 @@ static audio_track_time calculate_audio_track_time(const struct audio_buffer *a)
 
     const Uint64 total_ms   = total_frames   * 1000ULL / (Uint64)a->spec.freq;
     const Uint64 elapsed_ms = elapsed_frames * 1000ULL / (Uint64)a->spec.freq;
-    const Uint64 clamped_elapsed_ms = (elapsed_ms > total_ms) ? total_ms : elapsed_ms;
 
-    const Uint64 remaining_ms = total_ms - clamped_elapsed_ms;
+    const Uint64 clamped_elapsed_ms = (elapsed_ms > total_ms) ? total_ms : elapsed_ms;
 
     t.total_sec = (int)(total_ms / 1000ULL);
     t.elapsed_sec = (int)(clamped_elapsed_ms / 1000ULL);
 
     // For countdown UIs it's nicer to round up remaining time, so it hits 0 at the end.
-    t.remaining_sec = (int)((remaining_ms + 999ULL) / 1000ULL);
+    t.remaining_sec = t.total_sec - t.elapsed_sec;
 
     // Safety clamps
     if (t.elapsed_sec < 0) t.elapsed_sec = 0;
